@@ -1,7 +1,7 @@
-````markdown
-# GPT_Feedback ^~^
-**UKTA 작문 분석 결과를 기반으로 GPT 피드백을 생성하는 LLM 응용 프로그램**
+# GPT_Feedback ^~^  
+**UKTA 작문 분석 결과를 기반으로 GPT 피드백을 생성하는 LLM 응용 프로그램**  
 **인하대학교 KDD 연구실에서 개발합니다~**
+
 ---
 
 ## 기능 개요
@@ -16,6 +16,7 @@ UKTA 홈페이지: https://ukta.inha.ac.kr/
 ## 설치 방법
 
 ### 1. 리포지토리 클론
+
 ```bash
 git clone https://github.com/grrlkk/GPT_Feedback.git
 cd GPT_Feedback
