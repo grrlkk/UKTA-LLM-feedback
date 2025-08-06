@@ -1,75 +1,62 @@
-import json
+# prompt.py
 
-def create_feedback_prompt_from_ukta_json(file_path: str) -> str:
+def create_holistic_prompt(ukta_data: dict) -> str:
     """
-    UKTA JSON 분석 결과 파일에서 데이터를 읽어 GPT 피드백 생성용 프롬프트를 만듭니다.
+    (최종 모듈 버전) UKTA 데이터를 지능적으로 정제/해석하여,
+    GPT가 작문 컨설턴트 역할에만 집중하도록 하는 프롬프트를 생성합니다.
+
+    Args:
+        ukta_data (dict): 불러온 JSON 데이터 딕셔너리.
+
+    Returns:
+        str: GPT API에 전달할 최종 프롬프트 문자열.
     """
-    try:
-        with open(file_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-    except FileNotFoundError:
-        return f"오류: {file_path} 에서 파일을 찾을 수 없습니다."
-    except json.JSONDecodeError:
-        return f"오류: {file_path} 파일이 올바른 JSON 형식이 아닙니다."
-
-    results = data.get('results', {})
-    if not results:
-        return "오류: JSON 파일에 'results' 키가 없습니다."
-
+    results = ukta_data.get('results', {})
     original_text = results.get('correction', {}).get('origin', '원본 텍스트를 찾을 수 없습니다.')
-
-    # 맞춤법 및 띄어쓰기 교정 정보 추출
-    corrections = []
-    revised_sentences = results.get('correction', {}).get('revisedSentences', [])
-    for sentence in revised_sentences:
-        if 'revisedBlocks' in sentence:
-            for block in sentence['revisedBlocks']:
-                if block.get('revisions'):
-                    original_word = block.get('origin', {}).get('content', '')
-                    revised_word = block['revisions'][0].get('revised', '')
-                    reason = block['revisions'][0].get('comment', '')
-                    corrections.append(f"- 원문 '{original_word}' → 추천 '{revised_word}' ({reason})")
-
     scores = results.get('essay_score', {})
-    ttr = results.get('ttr', {})
-    similarity = results.get('similarity', {})
 
-    # 요약 텍스트 구성
-    summary_parts = [
-        "1. 영역별 점수 (5점 만점):",
-        f"   - 문법 및 표현: {scores.get('grammar', 'N/A')}점",
-        f"   - 어휘 사용: {scores.get('vocabulary', 'N/A')}점",
-        f"   - 글의 구조 및 일관성: {scores.get('structural_consistency', 'N/A')}점",
-        "\n2. 주요 언어 지표:",
-        f"   - 어휘 다양성 (TTR): {ttr.get('lemma_TTR', 0):.2f} (기준: 0.5 이상이면 다양한 어휘 사용으로 판단)",
-        f"   - 문장 간 유사도 (응집성): {similarity.get('avgSentSimilarity', 0):.2f} (기준: 0.3 이상이면 연결이 자연스러움)",
-        "\n3. 맞춤법 및 표현 교정 제안:"
-    ]
-    if corrections:
-        summary_parts.extend(corrections)
-    else:
-        summary_parts.append("   - 특별한 교정 사항이 발견되지 않았습니다. 훌륭합니다!")
+    # --- Python이 데이터의 1차 진단까지 완료 ---
+    # GPT의 해석 오류를 원천 차단하기 위해, Python 단에서 기준에 따라 질적 진단을 내립니다.
+    
+    ttr_val = results.get('ttr', {}).get('lemma_TTR', 0)
+    ttr_diag = f"적절함 (TTR: {ttr_val:.2f}, 기준치 0.5 이상)" if ttr_val >= 0.5 else f"다소 단조로움 (TTR: {ttr_val:.2f}, 기준치 0.5 미만)"
 
-    summary_text = "\n".join(summary_parts)
+    sent_len_std_val = results.get('sentenceLvl', {}).get('morph_sentLenStd', 0)
+    sent_len_diag = f"다양함 (리듬감 우수, 표준편차: {sent_len_std_val:.1f})" if sent_len_std_val > 5.0 else f"다소 단조로움 (리듬감 비슷, 표준편차: {sent_len_std_val:.1f})"
 
-    # ✅ 프롬프트에 점수/자질 활용 강조
-    prompt = f"""당신은 세계 최고의 한국어 작문 교육 전문가입니다. 아래 주어진 학생의 글과 UKTA 시스템의 분석 데이터를 바탕으로, 학생의 눈높이에 맞춰 긍정적이고 구체적인 피드백을 작성해주세요.
+    sim_val = results.get('similarity', {}).get('avgSentSimilarity', 0)
+    sim_diag = f"자연스러움 (문장 간 유사도: {sim_val:.2f}, 기준치 0.3 이상)" if sim_val >= 0.3 else f"연결고리 강화 필요 (문장 간 유사도: {sim_val:.2f}, 기준치 0.3 미만)"
 
-### [학생 글 원문]
+    top_k_features = scores.get('top_k_features', [])
+
+    # --- GPT에게 전달할 '사실 명세서(Fact Sheet)' 생성 ---
+    report_text = f"""[UKTA AI 진단 리포트]
+### 1. 어휘 구사력
+- AI 진단: {ttr_diag}
+
+### 2. 문장 구성력
+- AI 진단: {sent_len_diag}
+
+### 3. 논리적 응집성
+- AI 진단: {sim_diag}
+
+### 4. 채점 모델이 주목한 핵심 자질
+- {', '.join(top_k_features)}
+"""
+
+    # --- '근거 인용'과 '구체적 처방'을 강제하는 최종 프롬프트 ---
+    prompt = f"""당신은 AI가 분석한 '진단 리포트'의 내용을 학생이 이해하기 쉽게 글로 풀어주는 전문 작문 컨설턴트입니다.
+**당신의 임무는 주어진 'AI 진단' 결과를 절대 왜곡하거나 추가 판단 없이, 그대로 인용하여 친절하게 설명하고, 실질적인 개선 방안을 제시하는 것입니다.**
+
+[학생 글 원문]
 {original_text}
 
-### [UKTA 시스템 분석 데이터 요약]
-{summary_text}
+{report_text}
 
-### [피드백 작성 지시사항]
-1. **총평**: 글의 전반적인 인상과 특징을 간략하게 요약해주세요.
-2. **칭찬할 점**:
-   - 점수가 높은 영역(문법, 어휘, 구조) 또는 TTR, 문장 유사도 등 언어 지표가 긍정적인 부분을 구체적으로 언급해주세요.
-   - 학생이 어떤 점을 잘했는지 근거를 바탕으로 칭찬해주세요.
-3. **개선 제안**:
-   - 점수가 낮은 영역이나 지표(TTR이 낮거나 문장 간 연결이 부자연스러운 경우)를 중심으로 개선점을 제안해주세요.
-   - 맞춤법 교정 외에도 어휘의 다양성, 문장 구성, 표현력 등의 측면을 포함해주세요.
-   - 가능한 경우 원문 내용을 인용하여 설명하고, 구체적인 대안도 함께 제시해주세요.
-4. **어조**: 시종일관 격려하고 지지하는 따뜻한 어조를 유지해주세요.
+[피드백 보고서 작성 규칙]
+1.  **종합 스타일 진단**: 먼저, 위 리포트의 모든 진단을 종합하여 이 글쓴이의 작문 스타일을 한 문장으로 정의해주세요.
+2.  **엄격한 근거 인용 및 심층 설명**: 각 항목(어휘, 문장, 응집성)에 대한 설명을 시작할 때, 반드시 **"AI 진단에 따르면, [진단 결과]라고 합니다. 이는..."** 형식으로, 주어진 진단 결과를 **그대로 복사하여 인용**해야 합니다. 그 후 이것이 작문에서 어떤 의미인지 부드럽게 풀어서 설명해주세요.
+3.  **실행 가능한 개선 방안 제시**: 'AI 진단' 결과가 개선이 필요하다고 나온 경우, 반드시 원문에서 **구체적인 예시 문장**을 찾아 "이렇게 바꿔보세요"라고 명확한 수정안을 제시해야 합니다.
+4.  **Top-K 자질 기반 종합 의견**: '핵심 자질' 목록을 보고, "AI 채점 모델이 특히 당신의 글에서 ~ 부분을 중요하게 본 것 같습니다. 따라서 ~ 부분을 개선하는 것이 가장 큰 성장을 이끌어낼 것입니다." 와 같이 종합적인 조언을 제공해주세요.
 """
     return prompt
