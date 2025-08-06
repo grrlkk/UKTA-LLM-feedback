@@ -1,0 +1,4 @@
+openai==0.28
+python-dotenv>=1.0.1
+typing-extensions>=4.7.1
+loguru>=0.7.2
