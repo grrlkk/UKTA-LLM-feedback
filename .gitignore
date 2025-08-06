@@ -1,0 +1,36 @@
+# ▼ 가상환경 디렉터리
+.venv/
+env/
+venv/
+
+# ▼ Python bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# ▼ 배포/빌드 산출물
+dist/
+build/
+*.egg-info/
+
+# ▼ 환경 변수 파일
+.env
+.env.*
+
+# ▼ 로그 / 임시
+*.log
+*.sqlite3
+.DS_Store
+
+# ▼ IDE / Editor
+.vscode/
+.idea/
+*.swp
+
+# ▼ 테스트·커버리지
+htmlcov/
+.coverage
+coverage.xml
+
+# ▼ OS 파일
+Thumbs.db
