@@ -74,6 +74,7 @@ GPT_Feedback/
 ├── requirements.txt       # 패키지 목록
 ├── .env                   # OpenAI API 키
 ├── data_json/             # UKTA 결과 JSON 파일들
+├── results/               # 피드백 결과 Markdown
 ```
 
 ---
