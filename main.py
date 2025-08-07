@@ -7,23 +7,23 @@ from datetime import datetime
 from openai import OpenAI
 from dotenv import load_dotenv
 
-# .env 파일에서 환경 변수를 불러옵니다
+# .env 파일에서 환경 변수 호출
 load_dotenv()
 
 # OpenAI API 클라이언트 설정
 try:
     client = OpenAI(api_key=os.environ.get("OPENAI_API_KEY"))
 except Exception as e:
-    print(f"OpenAI API 키 설정에 문제가 발생했습니다: {e}")
+    print(f"OpenAI API 키 설정 에러: {e}")
     client = None
 
-# prompt.py 파일에서 프롬프트 생성 함수를 가져옵니다.
+# prompt.py: 프롬프트 생성 함수
 from prompt import create_holistic_prompt
 
 def call_gpt_api(prompt: str, model: str, temp: float) -> str:
-    """GPT API를 호출하여 피드백을 생성합니다."""
+    """GPT API로 피드백 생성"""
     if not client or not client.api_key:
-        return "오류: OpenAI 클라이언트가 초기화되지 않았습니다. .env 파일에 OPENAI_API_KEY가 올바르게 설정되었는지 확인해주세요."
+        return "오류:.env OPENAI_API_KEY 확인"
     try:
         response = client.chat.completions.create(
             model=model,
@@ -39,19 +39,17 @@ def call_gpt_api(prompt: str, model: str, temp: float) -> str:
 
 def save_feedback(feedback_content: str, model_name: str, directory: str = "./results"):
     """
-    생성된 피드백을 새로운 규칙에 따라 마크다운 파일로 저장합니다.
-    (예: fb_250807_gpt-4o_1.md)
+    생성된 피드백 마크다운으로 저장
+    (ex: fb_250807_gpt-4o_1.md)
     """
     try:
         os.makedirs(directory, exist_ok=True)
         
-        # 날짜(YYMMDD)와 모델명으로 기본 파일명 생성
+        # 날짜 + 모델명으로 파일 생성
         date_str = datetime.now().strftime("%y%m%d")
-        # 모델명에 포함될 수 있는 '/' 문자를 '_'로 변경하여 파일명 오류 방지
         sanitized_model_name = model_name.replace("/", "_")
         base_filename = f"fb_{date_str}_{sanitized_model_name}"
         
-        # 동일한 이름의 파일이 있을 경우, 순번을 증가시켜 중복 방지
         index = 1
         while True:
             file_name = f"{base_filename}_{index}.md"
@@ -63,9 +61,9 @@ def save_feedback(feedback_content: str, model_name: str, directory: str = "./re
         with open(file_path, 'w', encoding='utf-8') as f:
             f.write(feedback_content)
             
-        print(f"✅ 피드백이 성공적으로 저장되었습니다: {file_path}")
+        print(f"피드백 저장 완료: {file_path}")
     except Exception as e:
-        print(f"❌ 파일 저장 중 오류가 발생했습니다: {e}")
+        print(f"파일 저장 중 오류 발생: {e}")
 
 def main():
     """메인 실행 함수"""
@@ -81,7 +79,7 @@ def main():
         with open(args.file, 'r', encoding='utf-8') as f:
             ukta_data = json.load(f)
     except Exception as e:
-        print(f"❌ JSON 파일을 읽는 중 오류가 발생했습니다: {e}")
+        print(f"JSON 파일을 읽는 중 오류 발생: {e}")
         return
 
     final_prompt = create_holistic_prompt(ukta_data)
