@@ -68,11 +68,15 @@ def save_feedback(feedback_content: str, model_name: str, directory: str = "./re
 def main():
     """메인 실행 함수"""
     parser = argparse.ArgumentParser(description="UKTA 분석 결과로 GPT 피드백을 생성하고 저장합니다.")
-    parser.add_argument("--file", required=True, help="분석할 UKTA JSON 파일의 경로")
+    parser.add_argument("--file", required=True, help="분석할 UKTA JSON 파일명")
     parser.add_argument("--model", default="gpt-4o", help="사용할 OpenAI 모델")
     parser.add_argument("--temp", type=float, default=0.3, help="생성 시 Temperature 값")
     args = parser.parse_args()
 
+    default_data_dir = "/home/chanwoo/GPT_Feedback/data_json"
+    
+    if not os.path.isabs(args.file):
+            args.file = os.path.join(default_data_dir, args.file)
     print(f"[INFO] 파일 경로: {args.file}, 모델: {args.model}")
 
     try:

@@ -2,7 +2,7 @@
 
 def create_holistic_prompt(ukta_data: dict) -> str:
     """
-    (최종 모듈 버전) UKTA 데이터를 지능적으로 정제/해석하여,
+    UKTA 데이터를 지능적으로 정제/해석하여,
     GPT가 작문 컨설턴트 역할에만 집중하도록 하는 프롬프트를 생성합니다.
 
     Args:
