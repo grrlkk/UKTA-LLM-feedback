@@ -14,7 +14,7 @@
 
 ## 설치 방법
 
-### 1. 리포지토리 클론
+### 1. 레포지토리 클론
 
 ```bash
 git clone https://github.com/grrlkk/GPT_Feedback.git
