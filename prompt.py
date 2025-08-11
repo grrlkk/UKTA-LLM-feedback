@@ -1,5 +1,7 @@
 # prompt.py
 
+## 자질 선정되면 평균, 표준편차 계산 필요
+
 def create_holistic_prompt(ukta_data: dict) -> str:
     """
     UKTA 데이터를 지능적으로 정제/해석하여,
@@ -29,7 +31,7 @@ def create_holistic_prompt(ukta_data: dict) -> str:
 
     top_k_features = scores.get('top_k_features', [])
 
-    # --- GPT에게 전달할 '사실 명세서(Fact Sheet)' 생성 ---
+    # --- GPT에게 전달할 '사실 명세서' 생성 ---
     report_text = f"""[UKTA AI 진단 리포트]
 ### 1. 어휘 구사력
 - AI 진단: {ttr_diag}
