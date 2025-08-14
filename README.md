@@ -6,7 +6,7 @@
 
 ## 기능 개요
 
-* 이 프로젝트는 [UKTA 시스템](https://github.com/inhaKDD/UKTA-web)의 작문 분석 결과(JSON)를 받아 학생 눈높이에 맞춘 **칭찬 + 개선 제안 + 총평**을 포함한 GPT 피드백을 자동 생성합니다.
+* 이 프로젝트는 [UKTA 시스템](https://github.com/inhaKDD/UKTA-web)의 작문 분석 결과(JSON)를 받아 학생 눈높이에 맞춘 **잘한 점 + 개선 제안 + 총평**을 포함한 GPT 피드백을 자동 생성합니다.
 
 * UKTA 홈페이지: https://ukta.inha.ac.kr/
 
