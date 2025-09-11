@@ -1,5 +1,5 @@
 # 데이터 및 기본 설정
-data_path: "feat_train_500.parquet"
+data_path: "/home/chanwoo/GPT_Feedback/data/feat_train_500.parquet"
 
 # 상위 집단 정의 ('quantile' 또는 'eq')
 top_select: "eq"
@@ -13,7 +13,10 @@ teacher_parser:
   parse: True
   source_col: "essay_score_avg"
   delimiter: "#"
-  rubric_names: ""
+  rubric_names: "grammar, vocabulary, sentence_expression,
+    intra_paragraph_structure, inter_paragraph_structure,
+    structural_consistency, length, topic_clarity, originality,
+    prompt_comprehension, narrative"
 
 # L1 안정성 선택
 l1_params:
