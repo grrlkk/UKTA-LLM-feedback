@@ -19,40 +19,36 @@ warnings.simplefilter("ignore")
 # ---------------------------
 # 그리드 셀 내부 경량 스코어 + 대표 선택
 # ---------------------------
-def _grid_cell_rank(
-    df, feats, score_col, is_top, Z,
-    subsamples=30, C=0.8, partial_rho_min=0.10,
-    rho_thresh=0.90, seed=42,
-    partial_gate=False, partial_min=0.05
-):
-    """
-    - subsamples=0 이면 초경량 스크린(quick_screen: AUC+|rho|+|d|) + 간단 partial gate만 수행
-    - subsamples>0 이면 경량 부트스트랩/부분상관/L1 안정선택까지 포함
-    """
+def _grid_cell_rank(df, feats, score_col, is_top, Z,
+                    subsamples=30, C=0.8, partial_rho_min=0.10,
+                    rho_thresh=0.90, seed=42,
+                    partial_gate=False, partial_min=0.05):
     if len(feats) == 0:
-        return pd.DataFrame(columns=[
-            "feature_id", "auc", "d_abs", "spearman",
-            "partial_rho_abs", "l1_select_prob", "grid_score"
-        ])
+        return pd.DataFrame(columns=["feature_id","auc","d_abs","spearman",
+                                     "partial_rho_abs","l1_select_prob","grid_score"])
 
-    # 초경량 경로
     if subsamples == 0:
         q = stats_calculators.quick_screen(df, feats, score_col, is_top)  # AUC+|ρ|+|d|
-        # 부분상관(가벼운 루프) — gate 용
+        # 부분상관(게이트용)
         pr = {}
         y = df[score_col].astype(float)
         for f in feats:
             r = feature_selectors.partial_spearman(df[f], y, Z)
             pr[f] = abs(r) if pd.notna(r) else 0.0
         q["partial_rho_abs"] = q["feature_id"].map(pr)
+
         if partial_gate:
             q = q[q["partial_rho_abs"] >= partial_min].copy()
+
+        # ★ 게이트 후 비었으면 '항상' 빈 DF 반환 (list 금지)
+        if q.empty:
+            return pd.DataFrame(columns=["feature_id","auc","d_abs","spearman",
+                                         "partial_rho_abs","l1_select_prob","grid_score"])
+
         q["l1_select_prob"] = 0.0
         q.rename(columns={"combo": "grid_score"}, inplace=True)
-        return q[[
-            "feature_id", "auc", "d_abs", "spearman",
-            "partial_rho_abs", "l1_select_prob", "grid_score"
-        ]]
+        return q[["feature_id","auc","d_abs","spearman",
+                  "partial_rho_abs","l1_select_prob","grid_score"]]
 
     # 경량 통계
     stats_df = stats_calculators.discriminative_stats(
@@ -82,23 +78,27 @@ def _grid_cell_rank(
 
 
 def _select_cell_reps(df, stats_df_cell, rho_thresh=0.90, k=3):
-    """
-    셀 내부에서 상관-패밀리를 구성하고, family별 대표 1개씩 뽑아 상위 k개 반환
-    """
-    if stats_df_cell.empty:
-        return []
+    # ★ 항상 DataFrame을 반환
+    if stats_df_cell is None or len(stats_df_cell) == 0:
+        return pd.DataFrame(columns=["feature_id","grid_score","family_id"])
+
     cand = stats_df_cell.sort_values("grid_score", ascending=False)
     fam = feature_selectors.correlation_families(
         df, cand["feature_id"].tolist(), rho_thresh=rho_thresh, progress=False
     )
+    if fam is None or fam.empty:
+        # 가족이 하나도 안 생겨도 cand에서 상위 k개 그냥 반환
+        tmp = cand.head(k).copy()
+        tmp["family_id"] = np.arange(len(tmp))
+        return tmp[["feature_id","grid_score","family_id"]]
+
     cand2 = cand.merge(fam, on="feature_id", how="left")
-    reps = (
-        cand2.sort_values("grid_score", ascending=False)
-        .groupby("family_id", as_index=False).head(1)
-        .sort_values("grid_score", ascending=False)
-        .head(k)
-    )
-    return reps
+    reps = (cand2.sort_values("grid_score", ascending=False)
+                  .groupby("family_id", as_index=False).head(1)
+                  .sort_values("grid_score", ascending=False)
+                  .head(k))
+    # ★ 명시 스키마 보장
+    return reps[["feature_id","grid_score","family_id"]]
 
 
 # ---------------------------
@@ -152,7 +152,11 @@ def run_grid(
             partial_min=float(cfg_grid.get("partial_min", 0.05))
         )
         reps = _select_cell_reps(df, cell, rho_thresh=rho_thresh, k=k)
+
         out = []
+        if reps is None or reps.empty:
+            return out  # ★ 빈 DF면 바로 반환
+
         for _, r in reps.iterrows():
             out.append({
                 "feature_id": r["feature_id"],
