@@ -1,7 +1,16 @@
-# 데이터 및 기본 설정
+# 데이터
 data_path: "/home/chanwoo/GPT_Feedback/data/feat_train_500.parquet"
 
-# 상위 집단 정의 ('quantile' 또는 'eq')
+
+label:
+  mode: "two_stage"          # ← 두 단계 라벨 사용
+  total_col: "essay_scoreT_avg"
+  total_quantile: 0.80       # 총점 상위 20%를 우수로 간주
+  rubric_eq: 3.0             # 그 중 문법=3점만 양성
+  min_pos: 1000              # 양성이 너무 적으면 q를 0.05씩 낮추어 확보
+
+
+# 상위 집단 정의
 top_select: "eq"
 top_value: 3.0
 # quantile 쓰려면:
@@ -18,56 +27,42 @@ teacher_parser:
     structural_consistency, length, topic_clarity, originality,
     prompt_comprehension, narrative"
 
-# L1 안정성 선택
-l1_params:
-  subsamples: 50         # 충분히 안정 + 과도한 시간 X
-  sample_frac: 0.7
-  C: 1.0
-  select_pmin: 0.50      # 0.6보다 약간 완화해 후보 소실 방지
-
-# 부트스트랩
-bootstrap_params:
-  n_boot: 80             # 하이브리드 퍼널로 축소되므로 80이면 충분히 안정
-  topk_rank: 40
-
-# 상관 패밀리 임계값(절대 Spearman)
-rho_thresh: 0.85         # 0.8→0.85로 살짝 상향: 과병합 방지, 앵커 다양성↑
-
-# 최종 점수 가중치
-weights:
-  rho_weight: 1.5
-  specificity_weight: 1.0
-
-# 필터 임계값 (너무 빡세지 않게)
-filters:
-  partial_rho_min: 0.10  # 0.15→0.10: 유효 후보 보존
-  specificity_min: 0.0
-
-# 앵커(대표 피처) 개수
-anchor_counts:
-  min: 10                # 루브릭별 10개 보장
-  max: 12                # 여유분(동점/가족 분산용)
-
-# 하이브리드 퍼널(빠른 스크린 → 헤비 연산은 합집합만)
-hybrid:
-  enabled: true
-  screen_axis: ["pos", "type"]       # 품사 + 타입(=families) 양축 스크린
-  screen_topk_per_bucket: 30         # 버킷당 Top-K (버킷 많으면 20~30, 적으면 30~40)
-  screen_metric: "combo"             # z(AUC)+z(|rho|)+z(|d|)
-
-# TYPE(자질군) 버킷 정의 — 네 자질명 접두/키워드만 사용
-feature_grouping:
-  families:
-    - {name: "NDW",         patterns: ["^NDW_"] }
-    - {name: "TTR",         patterns: ["^ttr_", "^ttr_lemma_"] }
-    - {name: "Adjacency",   patterns: ["^adjacency_", "Overlap"] }
-    - {name: "SentenceRep", patterns: ["^sentenceLvlRep_"] }
-    - {name: "Length",      patterns: ["^sentenceLvl_.*(Len|paraLen|sentLen)"] }
-    - {name: "BasicCount",  patterns: ["^basic_count_"] }
-    - {name: "BasicDensity",patterns: ["^basic_density_"] }
-    - {name: "Readability", patterns: ["^readability_text_"] }
-    - {name: "Similarity",  patterns: ["^similarity_"] }
-
-# 기타
+# 하위 모듈 공통
+rho_thresh: 0.90        # 셀 내부 패밀리 병합 강도(다양성↑ 위해 0.90 권장)
 seed: 42
 downcast: True
+
+# TYPE 버킷 (정규식 우선순위, 첫 매치만)
+feature_grouping:
+  families:
+    - {name: "NDW",          patterns: ["^NDW_"] }
+    - {name: "TTR",          patterns: ["^ttr_"] }
+    - {name: "Adjacency",    patterns: ["^adjacency_"] }
+    - {name: "SentenceRep",  patterns: ["^sentenceLvlRep_"] }
+    - {name: "BasicDensity", patterns: ["^basic_density_"] }
+    - {name: "BasicCount",   patterns: ["^basic_count_"] }
+    - {name: "Readability",  patterns: ["^readability_"] }
+    - {name: "Similarity",   patterns: ["^similarity_"] }
+    - {name: "Length",       patterns: ["^sentenceLvl_.*(Len|paraLen|sentLen)", "^basic_level_.*Len"] }
+
+# GRID (버킷 로컬 예선)
+grid:
+  enable: true
+  local_scoring: true
+  mode: "both"         # pos | type | both | pos_type
+  top_per_cell: 2
+  skip_cell_min: 10
+  final_max_seed: 140
+  partial_gate: true          
+  partial_min: 0.05           
+
+
+# FINAL (시드만 결승)
+final:
+  refit: true
+  l1_subsamples: 160
+  l1_C: 0.7
+  rho_thresh: 0.85
+  keep_top: 12
+  min_auc: 0.56        
+  min_partial_rho: 0.06 

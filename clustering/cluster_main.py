@@ -1,250 +1,412 @@
-# main.py
+# clustering/cluster_main.py
 import argparse
 import warnings
 from pathlib import Path
 import yaml
 import pandas as pd
-import numpy as np  
+import numpy as np
+from joblib import Parallel, delayed  # 병렬화
 
-from ukta_builder.data_loader import (load_table, attach_teacher_scores, infer_feature_cols, create_top_mask)
-from ukta_builder.feature_meta import build_feature_meta  
+from ukta_builder.data_loader import (
+    load_table, attach_teacher_scores, infer_feature_cols, create_top_mask
+)
+from ukta_builder.feature_meta import build_feature_meta, _extract_pos_token
 from ukta_builder import stats_calculators, feature_selectors, utils
 
 warnings.simplefilter("ignore")
 
-def run_selection_for_bucket(stats_df, df, bucket_col: str, suffix: str, show_progress: bool, config: dict, outdir: Path, score_col: str):
+
+# ---------------------------
+# 그리드 셀 내부 경량 스코어 + 대표 선택
+# ---------------------------
+def _grid_cell_rank(
+    df, feats, score_col, is_top, Z,
+    subsamples=30, C=0.8, partial_rho_min=0.10,
+    rho_thresh=0.90, seed=42,
+    partial_gate=False, partial_min=0.05
+):
     """
-    버킷별로 상관-패밀리를 만들고 family 대표 1개씩 뽑은 뒤 점수 상위 N을 앵커로 선발.
-    families_{suffix}.csv, anchors_{suffix}.csv, bucket_summary_{suffix}.csv 생성.
+    - subsamples=0 이면 초경량 스크린(quick_screen: AUC+|rho|+|d|) + 간단 partial gate만 수행
+    - subsamples>0 이면 경량 부트스트랩/부분상관/L1 안정선택까지 포함
     """
-    from ukta_builder import feature_selectors
+    if len(feats) == 0:
+        return pd.DataFrame(columns=[
+            "feature_id", "auc", "d_abs", "spearman",
+            "partial_rho_abs", "l1_select_prob", "grid_score"
+        ])
 
-    # 1) 후보 피처 목록
-    ac = config['anchor_counts']
-    cand_feats = stats_df.loc[stats_df["is_candidate"], "feature_id"].tolist()
-    if not cand_feats:
-        print(f"WARNING[{suffix}]: No candidates passed filters; fallback to top 60 by score.")
-        cand_feats = stats_df.sort_values("score", ascending=False).head(60)["feature_id"].tolist()
+    # 초경량 경로
+    if subsamples == 0:
+        q = stats_calculators.quick_screen(df, feats, score_col, is_top)  # AUC+|ρ|+|d|
+        # 부분상관(가벼운 루프) — gate 용
+        pr = {}
+        y = df[score_col].astype(float)
+        for f in feats:
+            r = feature_selectors.partial_spearman(df[f], y, Z)
+            pr[f] = abs(r) if pd.notna(r) else 0.0
+        q["partial_rho_abs"] = q["feature_id"].map(pr)
+        if partial_gate:
+            q = q[q["partial_rho_abs"] >= partial_min].copy()
+        q["l1_select_prob"] = 0.0
+        q.rename(columns={"combo": "grid_score"}, inplace=True)
+        return q[[
+            "feature_id", "auc", "d_abs", "spearman",
+            "partial_rho_abs", "l1_select_prob", "grid_score"
+        ]]
 
-    # 2) 버킷별 상관-패밀리 구성
-    cand_df = stats_df[stats_df["feature_id"].isin(cand_feats)][["feature_id", bucket_col]].copy()
-    fam_parts = []
-    for bname, sub in cand_df.groupby(bucket_col, dropna=False):
-        sub_feats = sub["feature_id"].tolist()
-        if len(sub_feats) == 0:
-            continue
-        fam_sub = feature_selectors.correlation_families(df, sub_feats, config['rho_thresh'], progress=show_progress)
-        fam_sub[bucket_col] = bname
-        # (bucket, family_id)로 유일 ID 부여
-        fam_sub["family_id"] = fam_sub[bucket_col].astype(str) + "::" + fam_sub["family_id"].astype(str)
-        fam_parts.append(fam_sub)
-    fam_df = pd.concat(fam_parts, ignore_index=True) if fam_parts else pd.DataFrame(columns=['feature_id','family_id',bucket_col])
-    fam_df.to_csv(outdir / f"families_{suffix}.csv", index=False, encoding="utf-8-sig")
-
-    # 3) family 대표 1개씩 → 전체 상위 N
-    rep_df = stats_df[stats_df["feature_id"].isin(cand_feats)].merge(fam_df, on="feature_id", how="left")
-    rep_sorted = rep_df.sort_values("score", ascending=False)
-    anchors = rep_sorted.groupby("family_id", dropna=False).head(1)
-    anchors = anchors.sort_values("score", ascending=False).head(ac['max']).copy()
-
-    # min 보장
-    if len(anchors) < ac['min']:
-        extra = rep_sorted[~rep_sorted["feature_id"].isin(anchors["feature_id"])].head(ac['min'] - len(anchors))
-        anchors = pd.concat([anchors, extra], ignore_index=True).sort_values("score", ascending=False).head(ac['max'])
-
-    anchors.insert(0, "rubric", score_col)
-    anchors.to_csv(outdir / f"anchors_{suffix}.csv", index=False, encoding="utf-8-sig")
-    print(f"  → saved anchors_{suffix}.csv ({len(anchors)} rows)")
-
-    # 4) 버킷 요약
-    def _agg(g):
-        return pd.Series({
-            "n_feats": g["feature_id"].nunique(),
-            "n_candidates": int(g["is_candidate"].sum()),
-            "n_anchors": int(g["feature_id"].isin(anchors['feature_id']).sum()),
-            "score_top3_mean": g.sort_values("score", ascending=False)["score"].head(3).mean(skipna=True),
-            "auc_mean": g["auc"].mean(skipna=True),
-            "rho_partial_mean": g["partial_rho_abs"].mean(skipna=True),
-            "spec_mean": g["specificity"].mean(skipna=True)
-        })
-    sum_df = stats_df.groupby(bucket_col).apply(_agg).reset_index()
-    sum_df.insert(0, "rubric", score_col)
-    sum_df.to_csv(outdir / f"bucket_summary_{suffix}.csv", index=False, encoding="utf-8-sig")
-
-    return anchors[[ "rubric","feature_id","score",bucket_col ]].copy()
-
-
-def main():
-    parser = argparse.ArgumentParser(description="UKTA Data-driven Policy Builder")
-    parser.add_argument("--config", default="config.yml", help="Path to the config YAML file")
-    parser.add_argument("--score_col", required=True, help="Target rubric column to analyze (e.g., teacher_grammar)")
-    parser.add_argument("--outdir", required=True, help="Directory to save the output artifacts")
-    parser.add_argument("--no_progress", action="store_true", help="Disable progress bars")
-    parser.add_argument("--run_mode", choices=["pos", "type", "both"], default="both",
-                        help="선발 기준: 품사(POS)별, 타입(TYPE: NDW/TTR/Adjacency/...)별, 혹은 둘 다")
-    cli_args = parser.parse_args()
-
-    # 1. 설정 로드
-    with open(cli_args.config, 'r', encoding='utf-8') as f:
-        config = yaml.safe_load(f)
-    show_progress = not cli_args.no_progress
-    outdir = Path(cli_args.outdir); outdir.mkdir(parents=True, exist_ok=True)
-
-    # 2. 데이터 로딩 및 준비
-    print("STEP 1: Loading and preparing data...")
-    df = load_table(config['data_path'])
-    if config['downcast']:
-        df = utils.downcast_numeric(df)
-
-    if config['teacher_parser']['parse']:
-        tp_conf = config['teacher_parser']
-        names = [s.strip() for s in tp_conf['rubric_names'].split(',')] if tp_conf['rubric_names'] else None
-        df, _ = attach_teacher_scores(df, tp_conf['source_col'], tp_conf['delimiter'], names)
-
-    if cli_args.score_col not in df.columns:
-        raise ValueError(f"Score column '{cli_args.score_col}' not found in the data.")
-
-    feat_cols = infer_feature_cols(df)
-    print(f"INFO: Found {len(feat_cols)} feature columns to analyze.")
-
-    # 3. 상위 그룹 정의
-    print("STEP 2: Defining top-performing group...")
-    top_val = config.get('top_value', config.get('q_top'))
-    is_top = create_top_mask(df, cli_args.score_col, config['top_select'], top_val)
-    print(f"INFO: Top group ({config['top_select']} @ {top_val}) contains {is_top.sum()} samples ({is_top.mean()*100:.2f}%).")
-
-    # 2.5. 메타 태깅 + 하이브리드 퍼널(빠른 스크린)
-    print("STEP 2.5: Tagging features (POS/TYPE) and hybrid screening...")
-    meta_df = build_feature_meta(feat_cols, config)
-    meta_df.to_csv(outdir / "feature_meta.csv", index=False, encoding="utf-8-sig")
-
-    hyb = config.get("hybrid", {}) or {}
-    if hyb.get("enabled", False):
-        q = stats_calculators.quick_screen(df, feat_cols, cli_args.score_col, is_top)
-        q = q.merge(meta_df, on="feature_id", how="left")
-        axis = hyb.get("screen_axis", ["pos","type"])
-        metric = hyb.get("screen_metric", "combo")
-        topk = int(hyb.get("screen_topk_per_bucket", 30))
-        U = set()
-        if "pos" in axis:
-            for p in q["pos_bucket"].dropna().unique():
-                U.update(q.loc[q["pos_bucket"]==p].nlargest(topk, metric)["feature_id"].tolist())
-        if "type" in axis:
-            for t in q["type_bucket"].dropna().unique():
-                U.update(q.loc[q["type_bucket"]==t].nlargest(topk, metric)["feature_id"].tolist())
-        if len(U) < 60:
-            extra = q.nlargest(60, metric)["feature_id"].tolist()
-            U.update(extra)
-        feat_cols = [f for f in feat_cols if f in U]
-        print(f"INFO: Hybrid screened to {len(feat_cols)} features.")
-
-    # 4. 목표 밴드 계산
-    print("STEP 3: Computing target bands for top group...")
-    bands_df = stats_calculators.compute_target_bands(df, feat_cols, is_top, progress=show_progress)
-    bands_df.to_csv(outdir / "target_bands.csv", index=False, encoding="utf-8-sig")
-
-    # 5. 기본 통계량 및 부트스트랩 안정성 분석
-    print("STEP 4: Calculating discriminative stats and bootstrap stability...")
+    # 경량 통계
     stats_df = stats_calculators.discriminative_stats(
-        df, feat_cols, cli_args.score_col, is_top,
-        n_boot=config['bootstrap_params']['n_boot'],
-        topk_rank=config['bootstrap_params']['topk_rank'],
-        seed=config['seed'], progress=show_progress
+        df, feats, score_col, is_top, n_boot=30, topk_rank=20, seed=seed, progress=False
     )
+    # 부분상관
+    pr = {}
+    for f in feats:
+        r = feature_selectors.partial_spearman(df[f], df[score_col].astype(float), Z)
+        pr[f] = abs(r) if pd.notna(r) else 0.0
+    stats_df["partial_rho_abs"] = stats_df["feature_id"].map(pr)
 
-    # 6. 데이터 기반 피처 선택 (부분상관, L1, 특이성)
-    print("STEP 5: Running advanced feature selectors (this may take a while)...")
-    # (a) 부분 상관관계
-    teacher_cols = [c for c in df.columns if c.startswith("teacher_") and c != cli_args.score_col]
-    Z = df[teacher_cols].copy()
-    y_cont = df[cli_args.score_col].astype(float)
-    partial_rhos = {f: feature_selectors.partial_spearman(df[f], y_cont, Z) for f in utils._tqdm(feat_cols, desc="Partial Spearman", disable=not show_progress)}
-    stats_df["partial_rho_abs"] = stats_df["feature_id"].map(lambda f: abs(partial_rhos.get(f, 0)) if pd.notna(partial_rhos.get(f)) else 0)
-
-    # (b) L1 안정성 선택
-    l1_conf = config['l1_params']
-    l1_probs_arr = feature_selectors.l1_logit_stability(
-        df[feat_cols], is_top, l1_conf['C'], l1_conf['subsamples'], l1_conf['sample_frac'], config['seed']
+    # L1 안정 선택(경량)
+    stab = feature_selectors.l1_logit_stability(
+        df[feats].copy(), is_top, C=C, subsamples=subsamples, sample_frac=0.7, seed=seed, standardize=True
     )
-    stats_df["l1_select_prob"] = l1_probs_arr
+    stats_df["l1_select_prob"] = [float(p) for p in stab]
 
-    # (c) 특이성
-    specificity_scores = {}
-    for f in utils._tqdm(feat_cols, desc="Specificity", disable=not show_progress):
-        rho_g = partial_rhos.get(f, np.nan)
-        rho_others = [abs(feature_selectors.partial_spearman(df[f], df[tcol].astype(float), Z)) for tcol in teacher_cols]
-        max_other = max([r for r in rho_others if pd.notna(r)], default=0.0)
-        specificity_scores[f] = (abs(rho_g) - max_other) if pd.notna(rho_g) else np.nan
-    stats_df["specificity"] = stats_df["feature_id"].map(specificity_scores)
-
-    # 7. 최종 점수 계산 및 후보 필터링
-    print("STEP 6: Scoring features and selecting candidates...")
-    w = config['weights']
-    stats_df["score"] = (
+    # 셀 내부 점수
+    stats_df["grid_score"] = (
         utils.zscore(stats_df["auc"].fillna(0.5)) +
         utils.zscore(stats_df["d_abs"].fillna(0)) +
-        w['rho_weight'] * utils.zscore(stats_df["partial_rho_abs"].fillna(0)) +
-        utils.zscore(stats_df["boot_sign_agree"].fillna(0)) +
-        utils.zscore(stats_df["boot_rank_stability"].fillna(0)) +
-        w['specificity_weight'] * utils.zscore(stats_df["specificity"].fillna(0))
+        utils.zscore(stats_df["partial_rho_abs"].fillna(0)) +
+        0.5 * utils.zscore(stats_df["l1_select_prob"].fillna(0))
+    )
+    return stats_df
+
+
+def _select_cell_reps(df, stats_df_cell, rho_thresh=0.90, k=3):
+    """
+    셀 내부에서 상관-패밀리를 구성하고, family별 대표 1개씩 뽑아 상위 k개 반환
+    """
+    if stats_df_cell.empty:
+        return []
+    cand = stats_df_cell.sort_values("grid_score", ascending=False)
+    fam = feature_selectors.correlation_families(
+        df, cand["feature_id"].tolist(), rho_thresh=rho_thresh, progress=False
+    )
+    cand2 = cand.merge(fam, on="feature_id", how="left")
+    reps = (
+        cand2.sort_values("grid_score", ascending=False)
+        .groupby("family_id", as_index=False).head(1)
+        .sort_values("grid_score", ascending=False)
+        .head(k)
+    )
+    return reps
+
+
+# ---------------------------
+# POS/TYPE/교차 그리드 스크리닝 (병렬)
+# ---------------------------
+def run_grid(
+    df, feat_cols, meta_df, score_col, is_top, Z,
+    cfg_grid, cfg_core, outdir: Path, seed=42, n_jobs=8
+):
+    k = int(cfg_grid.get("top_per_cell", 3))
+    min_cell = int(cfg_grid.get("skip_cell_min", 8))
+    rho_thresh = float(cfg_core.get("rho_thresh", 0.90))
+    mode = cfg_grid.get("mode", "both")  # pos | type | both | pos_type
+
+    # other/OtherType 케이스-무시
+    pos_vals = [p for p in meta_df["pos_bucket"].unique() if p and str(p).lower() != "other"]
+    type_vals = [t for t in meta_df["type_bucket"].unique() if t and str(t).lower() != "othertype"]
+
+    # 태스크 구성
+    tasks = []
+    if mode in ("pos", "both"):
+        for p in pos_vals:
+            feats = meta_df.loc[meta_df["pos_bucket"] == p, "feature_id"].tolist()
+            feats = [f for f in feats if f in feat_cols]
+            if len(feats) >= min_cell:
+                tasks.append(("POS", p, "ANY", f"POS::{p}", feats))
+
+    if mode in ("type", "both"):
+        for t in type_vals:
+            feats = meta_df.loc[meta_df["type_bucket"] == t, "feature_id"].tolist()
+            feats = [f for f in feats if f in feat_cols]
+            if len(feats) >= min_cell:
+                tasks.append(("TYPE", "ANY", t, f"TYPE::{t}", feats))
+
+    if mode == "pos_type":
+        for p in pos_vals:
+            for t in type_vals:
+                feats = meta_df.loc[
+                    (meta_df["pos_bucket"] == p) & (meta_df["type_bucket"] == t), "feature_id"
+                ].tolist()
+                feats = [f for f in feats if f in feat_cols]
+                if len(feats) >= min_cell:
+                    tasks.append(("GRID", p, t, f"GRID::{p}x{t}", feats))
+
+    def _run_task(kind, p, t, tag, feats):
+        cell = _grid_cell_rank(
+            df, feats, score_col, is_top, Z,
+            subsamples=0, C=0.8, partial_rho_min=0.10,
+            rho_thresh=rho_thresh, seed=seed,
+            partial_gate=bool(cfg_grid.get("partial_gate", True)),
+            partial_min=float(cfg_grid.get("partial_min", 0.05))
+        )
+        reps = _select_cell_reps(df, cell, rho_thresh=rho_thresh, k=k)
+        out = []
+        for _, r in reps.iterrows():
+            out.append({
+                "feature_id": r["feature_id"],
+                "pos_bucket": p,
+                "type_bucket": t,
+                "source_bucket": tag,
+                "grid_score": float(r["grid_score"])
+            })
+        return out
+
+    # 병렬 실행
+    results = Parallel(
+        n_jobs=n_jobs, prefer="threads", require="sharedmem", verbose=0
+    )(delayed(_run_task)(*task) for task in tasks)
+    seeds_rows = [row for lst in results for row in lst]
+
+    seeds_df = pd.DataFrame(seeds_rows).drop_duplicates(subset=["feature_id", "source_bucket"])
+    seeds_df.insert(0, "rubric", score_col)
+    seeds_df.to_csv(outdir / "anchors_grid.csv", index=False, encoding="utf-8-sig")
+    print(f"🧩 anchors_grid.csv saved ({len(seeds_df)} rows)")
+
+    # RRF로 버킷 간 순위 융합 → 최종 seed list
+    if seeds_df.empty:
+        pd.DataFrame({"feature_id": []}).to_csv(outdir / "seeds_union.csv", index=False, encoding="utf-8-sig")
+        return [], seeds_df
+
+    seeds_df["rank"] = seeds_df.groupby("source_bucket")["grid_score"].rank(ascending=False, method="dense")
+    seeds_df["rrf"] = 1.0 / (60.0 + seeds_df["rank"])
+    fused = (
+        seeds_df.groupby("feature_id", as_index=False)["rrf"].sum()
+        .sort_values("rrf", ascending=False)
+    )
+    max_seed = int(cfg_grid.get("final_max_seed", 180))
+    seed_list = fused.head(max_seed)["feature_id"].tolist()
+    pd.DataFrame({"feature_id": seed_list}).to_csv(outdir / "seeds_union.csv", index=False, encoding="utf-8-sig")
+    print(f"🌱 seeds_union.csv saved ({len(seed_list)} seeds)")
+    return seed_list, seeds_df
+
+
+# ---------------------------
+# 시드만 결승(비싼 재적합)  — 부분상관 병렬화
+# ---------------------------
+def final_refit(df, score_col, seeds, is_top, Z, cfg_final, outdir: Path, n_jobs=8):
+    if not seeds:
+        print("⚠️ final_refit: no seeds; skip")
+        return pd.DataFrame(columns=["rubric", "feature_id"])
+    seeds = [f for f in seeds if f in df.columns]
+
+    stats_seed = stats_calculators.discriminative_stats(
+        df, seeds, score_col, is_top,
+        n_boot=60, topk_rank=30, seed=42, progress=False
     )
 
-    f = config['filters']
-    cond = (stats_df["partial_rho_abs"].fillna(0) >= f['partial_rho_min']) & \
-           (stats_df["l1_select_prob"].fillna(0) >= l1_conf['select_pmin']) & \
-           (stats_df["specificity"].fillna(0) >= f['specificity_min'])
-    stats_df["is_candidate"] = cond
-    stats_df.to_csv(outdir / "feature_importance.csv", index=False, encoding="utf-8-sig")
+    # 부분상관 병렬화
+    def _ps(f):
+        r = feature_selectors.partial_spearman(df[f], df[score_col].astype(float), Z)
+        return f, (abs(r) if pd.notna(r) else 0.0)
 
-    # 8. POS / TYPE 두 런으로 앵커 선발 + 비교
-    stats_df = stats_df.merge(meta_df, on="feature_id", how="left")
+    pairs = Parallel(n_jobs=n_jobs, prefer="threads", require="sharedmem", verbose=0)(
+        delayed(_ps)(f) for f in seeds
+    )
+    pr = dict(pairs)
 
-    anchors_pos = anchors_type = None
-    if cli_args.run_mode in ("pos", "both"):
-        print("STEP 7-POS: 품사(POS)-루브릭 기준 선발...")
-        anchors_pos = run_selection_for_bucket(
-            stats_df, df, bucket_col="pos_bucket", suffix="pos",
-            show_progress=show_progress, config=config, outdir=outdir, score_col=cli_args.score_col
+    # L1 안정선택
+    stab_arr = feature_selectors.l1_logit_stability(
+        df[seeds].copy(), is_top, C=float(cfg_final.get("l1_C", 0.7)),
+        subsamples=int(cfg_final.get("l1_subsamples", 120)), sample_frac=0.7, seed=42
+    )
+    stab = {f: float(p) for f, p in zip(seeds, stab_arr)}
+
+    stats_seed["partial_rho_abs"] = stats_seed["feature_id"].map(pr)
+    stats_seed["l1_select_prob"] = stats_seed["feature_id"].map(stab)
+    stats_seed["final_score"] = (
+        utils.zscore(stats_seed["auc"].fillna(0.5)) +
+        utils.zscore(stats_seed["d_abs"].fillna(0)) +
+        1.5 * utils.zscore(stats_seed["partial_rho_abs"].fillna(0)) +
+        utils.zscore(stats_seed["boot_sign_agree"].fillna(0)) +
+        utils.zscore(stats_seed["boot_rank_stability"].fillna(0)) +
+        utils.zscore(stats_seed["l1_select_prob"].fillna(0))
+    )
+
+    # 결승 단계 최소 문턱
+    min_auc = float(cfg_final.get("min_auc", 0.56))
+    min_pr = float(cfg_final.get("min_partial_rho", 0.06))
+    stats_seed = stats_seed[
+        (stats_seed["auc"] >= min_auc) & (stats_seed["partial_rho_abs"] >= min_pr)
+    ].copy()
+    if len(stats_seed) == 0:
+        print(
+            f"⚠️ final_refit: all filtered by min gates (AUC>={min_auc}, |partial ρ|>={min_pr}). "
+            f"Relax thresholds or check label."
+        )
+        # 아무것도 없으면 빈 결과 저장 후 반환
+        empty = pd.DataFrame(columns=["rubric", "feature_id", "final_score"])
+        empty.to_csv(outdir / "anchors_final.csv", index=False, encoding="utf-8-sig")
+        return empty
+
+    # (중요) family 묶기 대상 = 문턱 통과한 최종 후보 집합
+    fam = feature_selectors.correlation_families(
+        df, stats_seed["feature_id"].tolist(),
+        rho_thresh=float(cfg_final.get("rho_thresh", 0.85)), progress=False
+    )
+    rep = stats_seed.merge(fam, on="feature_id", how="left")
+    top_rep = (
+        rep.sort_values("final_score", ascending=False)
+        .groupby("family_id", as_index=False).head(1)
+        .sort_values("final_score", ascending=False)
+        .head(int(cfg_final.get("keep_top", 12)))
+    )
+
+    # 해석 태그(간단히 POS만)
+    def _to_pos_bucket(name: str) -> str:
+        tok = _extract_pos_token(name)
+        return (tok or "OTHER").upper()
+
+    ann = []
+    for f in top_rep["feature_id"]:
+        ann.append({
+            "feature_id": f,
+            "pos_bucket": _to_pos_bucket(f),
+            "type_bucket": "—"
+        })
+    ann_df = pd.DataFrame(ann)
+    out = top_rep.merge(ann_df, on="feature_id", how="left")
+    out.insert(0, "rubric", score_col)
+    out.to_csv(outdir / "anchors_final.csv", index=False, encoding="utf-8-sig")
+    print(f"🏁 anchors_final.csv saved ({len(out)} rows)")
+    return out
+
+
+def build_two_stage_mask(
+    df, total_col: str, total_q: float,
+    rubric_col: str, rubric_eq: float,
+    min_pos: int = 1000
+):
+    """
+    총점 상위 q(기본 0.80) 컷 내에서 rubric == 특정값(eq, 기본 3.0)만 양성으로 잡는 라벨링.
+    양성이 min_pos보다 적으면 q를 0.05씩 낮추며 최대 0.60까지 완화.
+    """
+    q = float(total_q)
+
+    def make_mask(qcut):
+        thr = np.nanpercentile(df[total_col].values, qcut * 100.0)
+        m_total = (df[total_col] >= thr)
+        m_rub = np.isclose(df[rubric_col].astype(float), rubric_eq)
+        return (m_total & m_rub), thr
+
+    mask, thr = make_mask(q)
+    while mask.sum() < int(min_pos) and q > 0.60:
+        q -= 0.05
+        mask, thr = make_mask(q)
+
+    print(f"INFO: Two-stage threshold on {total_col}: q={q:.2f} → thr={thr:.4f}")
+    return mask
+
+
+# ---------------------------
+# Main
+# ---------------------------
+def main():
+    parser = argparse.ArgumentParser(description="Bucket-first selector (POS/TYPE grid)")
+    parser.add_argument("--config", default="config.yml")
+    parser.add_argument("--score_col", required=True)
+    parser.add_argument("--outdir", required=True)
+    parser.add_argument("--no_progress", action="store_true")
+    parser.add_argument("--n_jobs", type=int, default=8, help="Parallel workers for grid/final refit")
+    args = parser.parse_args()
+
+    with open(args.config, "r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f)
+
+    show_progress = not args.no_progress
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # 1) Load
+    print("STEP 1: Loading and preparing data...")
+    df = load_table(Path(cfg["data_path"]))
+    if cfg.get("downcast", True):
+        df = utils.downcast_numeric(df)
+
+    # teacher parse
+    tp = cfg.get("teacher_parser", {}) or {}
+    if tp.get("parse", True):
+        names = [s.strip() for s in tp.get("rubric_names", "").split(",")] if tp.get("rubric_names") else None
+        df, _ = attach_teacher_scores(
+            df, tp.get("source_col", "essay_score_avg"), tp.get("delimiter", "#"), names
         )
 
-    if cli_args.run_mode in ("type", "both"):
-        print("STEP 7-TYPE: 자질 TYPE(NDW/TTR/...) - 루브릭 기준 선발...")
-        anchors_type = run_selection_for_bucket(
-            stats_df, df, bucket_col="type_bucket", suffix="type",
-            show_progress=show_progress, config=config, outdir=outdir, score_col=cli_args.score_col
+    score_col = args.score_col
+    if score_col not in df.columns:
+        raise ValueError(f"Score column '{score_col}' not found.")
+
+    # 2) Feature pool & Meta
+    feat_cols_all = infer_feature_cols(df)
+    print(f"INFO: Found {len(feat_cols_all)} feature columns to analyze.")
+    meta_df = build_feature_meta(feat_cols_all, cfg)
+    meta_df.to_csv(outdir / "feature_meta.csv", index=False, encoding="utf-8-sig")
+
+    # 3) Top mask (two-stage 라벨링 지원)
+    lbl = cfg.get("label", {}) or {}
+    if lbl.get("mode") == "two_stage":
+        is_top = build_two_stage_mask(
+            df,
+            total_col=lbl.get("total_col", "essay_scoreT_avg"),
+            total_q=lbl.get("total_quantile", 0.80),
+            rubric_col=score_col,               # CLI로 들어온 teacher_* (ex. teacher_grammar)
+            rubric_eq=lbl.get("rubric_eq", 3.0),
+            min_pos=lbl.get("min_pos", 1000),
         )
+        print(f"INFO: Two-stage top → positives={int(is_top.sum())} ({is_top.mean()*100:.2f}%)")
+    else:
+        top_select = cfg.get("top_select", "eq")
+        top_value = cfg.get("top_value", cfg.get("q_top", 0.8))
+        is_top = create_top_mask(df, score_col, top_select, top_value)
+        print(f"INFO: Top group ({top_select} @ {top_value}) contains {is_top.sum()} samples ({is_top.mean()*100:.2f}%).")
 
-    if cli_args.run_mode == "both" and anchors_pos is not None and anchors_type is not None:
-        print("STEP 8: POS vs TYPE 결과 비교 파일 생성...")
-        ap = set(anchors_pos["feature_id"].tolist())
-        at = set(anchors_type["feature_id"].tolist())
-        inter = ap & at
-        union = ap | at
-        cmp_rows = [{
-            "rubric": cli_args.score_col,
-            "pos_count": len(ap),
-            "type_count": len(at),
-            "overlap_count": len(inter),
-            "jaccard": (len(inter) / len(union)) if len(union) > 0 else 0.0
-        }]
-        pd.DataFrame(cmp_rows).to_csv(outdir / "compare_pos_vs_type.csv", index=False, encoding="utf-8-sig")
+    # 4) Controls Z (auto)
+    teacher_cols = [c for c in df.columns if c.startswith("teacher_") and c != score_col]
+    size_candidates = [
+        "basic_count_word_Cnt", "basic_count_sentence_Cnt",
+        "sentenceLvl_char_paraLenAvg", "sentenceLvl_word_paraLenAvg",
+        "essay_len"
+    ]
+    basic_controls = [c for c in size_candidates if c in df.columns]
+    Z_cols = list(dict.fromkeys(teacher_cols + basic_controls))
+    Z = df[Z_cols].copy() if Z_cols else pd.DataFrame(index=df.index)
 
-        # 상세 매핑
-        adetail = anchors_pos.merge(anchors_type, on="feature_id", how="outer", suffixes=("_pos","_type"))
-        adetail.insert(0, "rubric", cli_args.score_col)
-        adetail.to_csv(outdir / "compare_details.csv", index=False, encoding="utf-8-sig")
+    # 5) GRID local screening → seeds (병렬 태스크 내부에서 수행)
+    print("STEP 2: Grid screening (POS/TYPE buckets)")
+    cfg_grid = cfg.get("grid", {
+        "enable": True, "local_scoring": True, "top_per_cell": 3,
+        "skip_cell_min": 8, "mode": "both", "final_max_seed": 180
+    })
+    cfg_core = {"rho_thresh": cfg.get("rho_thresh", 0.90)}
+    seeds, seeds_df = run_grid(
+        df, feat_cols_all, meta_df, score_col, is_top, Z,
+        cfg_grid, cfg_core, outdir, seed=cfg.get("seed", 42), n_jobs=args.n_jobs
+    )
 
-        # 교차 매트릭스(POS x TYPE)
-        union_df = pd.concat([
-            anchors_pos.assign(source="pos"),
-            anchors_type.assign(source="type")
-        ], ignore_index=True).merge(meta_df, on="feature_id", how="left")
-        cross = union_df.pivot_table(index="pos_bucket", columns="type_bucket", values="feature_id",
-                                     aggfunc="nunique", fill_value=0)
-        cross.to_csv(outdir / "compare_matrix_pos_x_type.csv", encoding="utf-8-sig")
+    # 6) Final refit on seeds (부분상관 병렬)
+    if (cfg.get("final", {}) or {}).get("refit", True):
+        print("STEP 3: Final refit (expensive on seeds)")
+        _ = final_refit(
+            df, score_col, seeds, is_top, Z,
+            cfg_final=cfg.get("final", {
+                "l1_subsamples": 120, "l1_C": 0.7, "rho_thresh": 0.85, "keep_top": 12
+            }),
+            outdir=outdir, n_jobs=args.n_jobs
+        )
 
     print("\n✅ Analysis Complete!")
-    print(f"Find your artifacts in: {outdir.resolve()}")
+    print(f"Artifacts -> {outdir.resolve()}")
+
 
 if __name__ == "__main__":
     main()
