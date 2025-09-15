@@ -3,7 +3,7 @@ data_path: "/home/chanwoo/GPT_Feedback/data/feat_train_500.parquet"
 
 
 label:
-  mode: "two_stage"          # ← 두 단계 라벨 사용
+  mode: "single"          # ← 두 단계 라벨 사용
   total_col: "essay_scoreT_avg"
   total_quantile: 0.85       # 총점 상위 15%를 우수로 간주
   rubric_eq: 3.0             # 그 중 문법=3점만 양성
@@ -50,11 +50,11 @@ grid:
   enable: true
   local_scoring: true
   mode: "both"         # pos | type | both | pos_type
-  top_per_cell: 3
-  skip_cell_min: 8
+  top_per_cell: 5
+  skip_cell_min: 6
   final_max_seed: 200
   partial_gate: true          
-  partial_min: 0.04           
+  partial_min: 0.06           
 
 
 # FINAL (시드만 결승)
@@ -63,6 +63,6 @@ final:
   l1_subsamples: 160
   l1_C: 0.7
   rho_thresh: 0.9
-  keep_top: 12
-  min_auc: 0.54        
-  min_partial_rho: 0.05
+  keep_top: 10
+  min_auc: 0.52        
+  min_partial_rho: 0.045

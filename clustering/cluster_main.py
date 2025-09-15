@@ -151,7 +151,13 @@ def run_grid(
             partial_gate=bool(cfg_grid.get("partial_gate", True)),
             partial_min=float(cfg_grid.get("partial_min", 0.05))
         )
-        reps = _select_cell_reps(df, cell, rho_thresh=rho_thresh, k=k)
+        if cell is not None and not cell.empty:
+            cell = cell.merge(meta_df[["feature_id", "type_bucket"]], on="feature_id", how="left")
+            fam_w = cfg_grid.get("family_weights", {}) or {}
+            cell["grid_score"] = cell["grid_score"] * cell["type_bucket"].map(fam_w).fillna(1.0)
+
+        reps = _select_cell_reps(df, cell, rho_thresh=rho_thresh, k=k)  # ← 조정된 grid_score로 대표 선택
+
 
         out = []
         if reps is None or reps.empty:
@@ -199,7 +205,8 @@ def run_grid(
 # ---------------------------
 # 시드만 결승(비싼 재적합)  — 부분상관 병렬화
 # ---------------------------
-def final_refit(df, score_col, seeds, is_top, Z, cfg_final, outdir: Path, n_jobs=8):
+def final_refit(df, score_col, seeds, is_top, Z, cfg_final, outdir: Path, n_jobs=8,
+                meta_df=None, fam_weights=None):
     if not seeds:
         print("⚠️ final_refit: no seeds; skip")
         return pd.DataFrame(columns=["rubric", "feature_id"])
@@ -237,7 +244,30 @@ def final_refit(df, score_col, seeds, is_top, Z, cfg_final, outdir: Path, n_jobs
         utils.zscore(stats_seed["boot_rank_stability"].fillna(0)) +
         utils.zscore(stats_seed["l1_select_prob"].fillna(0))
     )
+    if meta_df is not None and not meta_df.empty:
+        stats_seed = stats_seed.merge(meta_df[["feature_id", "type_bucket"]], on="feature_id", how="left")
+    else:
+        stats_seed["type_bucket"] = "—"
 
+    fam_wmap = (fam_weights or {})  # 예: {"TTR":0.80, "NDW":0.85}
+    stats_seed["final_score"] = stats_seed["final_score"] * stats_seed["type_bucket"].map(fam_wmap).fillna(1.0)
+
+    # 소프트 감쇠: 같은 family에서 2개째 0.90, 3개째 0.81...
+    decay_base = float(cfg_final.get("family_decay_base", 0.90))
+    from collections import defaultdict
+    seen = defaultdict(int)
+    order = stats_seed.sort_values("final_score", ascending=False)
+    decayed = []
+
+    for _, r in order.iterrows():
+        fam = r["type_bucket"]
+        seen[fam] += 1
+        rank_in_family = seen[fam]
+        decay = decay_base ** max(0, rank_in_family - 1)
+        decayed.append(r["final_score"] * decay)
+
+    stats_seed.loc[order.index, "final_score"] = decayed
+    
     # 결승 단계 최소 문턱
     min_auc = float(cfg_final.get("min_auc", 0.56))
     min_pr = float(cfg_final.get("min_partial_rho", 0.06))
@@ -392,6 +422,7 @@ def main():
         "skip_cell_min": 8, "mode": "both", "final_max_seed": 180
     })
     cfg_core = {"rho_thresh": cfg.get("rho_thresh", 0.90)}
+    cfg_grid["family_weights"] = cfg.get("family_weights", {})
     seeds, seeds_df = run_grid(
         df, feat_cols_all, meta_df, score_col, is_top, Z,
         cfg_grid, cfg_core, outdir, seed=cfg.get("seed", 42), n_jobs=args.n_jobs
@@ -405,7 +436,8 @@ def main():
             cfg_final=cfg.get("final", {
                 "l1_subsamples": 120, "l1_C": 0.7, "rho_thresh": 0.85, "keep_top": 12
             }),
-            outdir=outdir, n_jobs=args.n_jobs
+            outdir=outdir, n_jobs=args.n_jobs,
+            meta_df= meta_df, fam_weights=cfg.get("family_weights", {}),
         )
 
     print("\n✅ Analysis Complete!")
