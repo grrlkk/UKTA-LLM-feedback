@@ -66,3 +66,8 @@ final:
   keep_top: 10
   min_auc: 0.52        
   min_partial_rho: 0.045
+
+
+family_weights:
+    TTR: 0.80     
+    NDW: 0.85     
